@@ -1,0 +1,8 @@
+{
+    "input": {
+        "vocal_url": "https://github.com/ouor/worker-rvc-nano/raw/refs/heads/main/test/vocal.mp3",
+        "model_url": "https://huggingface.co/trolley/rvc-models/resolve/main/afreeca_nyanya.pth?download=true",
+        "f0_up_key": 0,
+        "tag": "worker_rvc_nano_local_test"
+    }
+}
