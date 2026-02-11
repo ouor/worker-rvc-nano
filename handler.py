@@ -1,18 +1,27 @@
 """
-RunPod Serverless Handler for RVC (Retrieval-based Voice Conversion) inference.
-Fixed settings: f0_method=rmvpe, output=opus/ogg/128kbps
-Storage: boto3 S3-compatible storage
+RunPod Serverless Handler for RVC Voice Conversion — v2
+
+Changes from v1:
+  - Multiple input URLs (list), including data:audio/... Data URLs
+  - User-configurable output format / bitrate / sample_rate
+  - Structured response with per-file results
+  - Comprehensive metadata with debug trace / resource / performance / files / logs
+  - All artifacts (inputs, outputs, model, index) uploaded to R2
 """
 
 import os
 import sys
+import re
 import base64
 import hashlib
 import time
+import json
+import logging
 import traceback
 import subprocess
-from datetime import datetime
-from typing import Optional, Tuple, Dict, Any
+import tempfile
+from datetime import datetime, timezone
+from typing import Optional, Tuple, Dict, Any, List
 
 import torch
 import numpy as np
@@ -29,70 +38,59 @@ from botocore.exceptions import (
 sys.path.insert(0, "/src")
 
 import runpod
-from runpod.serverless.utils.rp_validator import validate
 
-from schemas import (
-    INPUT_SCHEMA,
-    InferenceMetadata,
-    AudioInfo,
-    ModelInfo,
-    TimingMetrics,
-    ErrorInfo,
-    create_success_output,
-    create_error_output,
-    # Fixed constants
-    F0_METHOD,
-    OUTPUT_FORMAT,
-    OUTPUT_CODEC,
-    OUTPUT_BITRATE,
-    OUTPUT_SAMPLE_RATE,
+from schemas_new import (
+    generate_uuid7,
+    SUPPORTED_FORMATS,
+    SUPPORTED_BITRATES,
+    SUPPORTED_SAMPLE_RATES,
+    LOSSLESS_FORMATS,
+    MIME_TO_EXT,
+    DEFAULT_FORMAT,
+    DEFAULT_BITRATE,
+    DEFAULT_SAMPLE_RATE,
+    DEFAULT_F0_UP_KEY,
     DEFAULT_INDEX_RATE,
+    F0_METHOD,
+    FILTER_RADIUS,
+    RMS_MIX_RATE,
+    PROTECT,
+    MIN_AUDIO_DURATION,
+    DOWNLOAD_TIMEOUT,
+    FileResult,
+    TraceInfo,
+    ResourceInfo,
+    PerformanceInfo,
+    InputFileDebug,
+    FilesDebugInfo,
+    DebugInfo,
+    Metadata,
+    build_success_response,
+    build_fail_response,
 )
-from exceptions import (
-    RVCWorkerException,
-    # Validation
-    ValidationException,
-    MissingRequiredFieldException,
-    InvalidFieldTypeException,
-    FieldConstraintException,
-    # Download
-    DownloadException,
-    URLNotReachableException,
-    URLNotFoundException,
-    URLForbiddenException,
-    DownloadTimeoutException,
-    DownloadedFileCorruptException,
-    # Audio
-    AudioException,
-    InvalidAudioFormatException,
-    AudioCorruptedException,
-    AudioTooShortException,
-    AudioLoadException,
-    # Model
-    ModelException,
-    InvalidModelFileException,
-    ModelCorruptedException,
-    ModelLoadException,
-    InvalidIndexFileException,
-    # Inference
-    InferenceException,
-    CUDAOutOfMemoryException,
-    PitchExtractionException,
-    FeatureExtractionException,
-    VoiceConversionException,
-    # Encoding
-    EncodingException,
-    FFmpegNotAvailableException,
-    FFmpegEncodingException,
-    OutputWriteException,
-    # Upload (S3)
-    UploadException,
-    S3NotConfiguredException,
-    S3CredentialsException,
-    S3BucketException,
-    S3UploadException,
-    # Helper
-    classify_exception,
+from exceptions_new import (
+    RVCError,
+    EmptyInputURLError,
+    FormatNotSupportedError,
+    InvalidBitrateError,
+    InvalidSampleRateError,
+    InvalidF0UpKeyError,
+    InvalidIndexRateError,
+    InvalidDataURLError,
+    MissingRequiredFieldError,
+    ModelDownloadError,
+    IndexDownloadError,
+    InputDownloadError,
+    ModelLoadError,
+    InferenceError,
+    CUDAOutOfMemoryError,
+    EncodingError,
+    FFmpegNotAvailableError,
+    S3NotConfiguredError,
+    S3UploadError,
+    InvalidAudioError,
+    AudioTooShortError,
+    AllInputsFailedError,
 )
 from src.rvc import RVCInference
 
@@ -107,78 +105,116 @@ HUBERT_PATH = f"{ASSETS_DIR}/hubert/hubert_base.pt"
 RMVPE_PATH = f"{ASSETS_DIR}/rmvpe/rmvpe.pt"
 MODEL_CACHE_DIR = "/tmp/models"
 AUDIO_CACHE_DIR = "/tmp/audio"
-OUTPUT_DIR = "/tmp/output"
-
-# Fixed RVC parameters
-FILTER_RADIUS = 3
-RMS_MIX_RATE = 0.25
-PROTECT = 0.33
-
-# Limits
-MIN_AUDIO_DURATION = 0.5  # seconds
-DOWNLOAD_TIMEOUT = 120  # seconds
+WORK_DIR = "/tmp/work"
 
 # S3 Configuration
 S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL")
 S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY")
 S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY")
 S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME")
+S3_KEY_PREFIX = os.environ.get("S3_KEY_PREFIX", "worker-rvc-nano")
 S3_REGION = os.environ.get("S3_REGION", "auto")
-S3_PUBLIC_URL = os.environ.get("S3_PUBLIC_URL")  # Optional: custom public URL prefix
+S3_PUBLIC_URL = os.environ.get("S3_PUBLIC_URL")
+S3_PRESIGNED_EXPIRY = int(os.environ.get("S3_PRESIGNED_EXPIRY", 60 * 60 * 24))  # 1 day
 
 
 # =============================================================================
-# S3 Client
+# Logging — dual output: console + in-memory list (captured into metadata)
+# =============================================================================
+class ListLogHandler(logging.Handler):
+    """Captures formatted log lines into an internal list."""
+
+    def __init__(self):
+        super().__init__()
+        self.logs: List[str] = []
+
+    def emit(self, record):
+        try:
+            self.logs.append(self.format(record))
+        except Exception:
+            pass
+
+    def reset(self):
+        self.logs.clear()
+
+    def snapshot(self) -> List[str]:
+        return list(self.logs)
+
+
+LOG_FORMAT = "[%(asctime)s] %(levelname)s | %(message)s"
+LOG_DATEFMT = "%H:%M:%S"
+
+logger = logging.getLogger("rvc_worker")
+logger.setLevel(logging.DEBUG)
+
+_console = logging.StreamHandler(sys.stdout)
+_console.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
+logger.addHandler(_console)
+
+_list_handler = ListLogHandler()
+_list_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
+logger.addHandler(_list_handler)
+
+
+# =============================================================================
+# Timer
+# =============================================================================
+class Timer:
+    """Context-manager stopwatch."""
+
+    def __init__(self):
+        self.elapsed: float = 0.0
+
+    def __enter__(self):
+        self._start = time.perf_counter()
+        return self
+
+    def __exit__(self, *_):
+        self.elapsed = time.perf_counter() - self._start
+
+
+# =============================================================================
+# S3 Storage
 # =============================================================================
 class S3Storage:
-    """
-    S3-compatible storage client using boto3.
-    Supports AWS S3, Cloudflare R2, MinIO, etc.
-    """
-    
+    """S3-compatible storage client (AWS S3, Cloudflare R2, MinIO, etc.)."""
+
     def __init__(self):
         self._client = None
         self._configured = False
-        self._check_configuration()
-    
-    def _check_configuration(self):
-        """Check if S3 is properly configured."""
-        required_vars = {
+        self._check()
+
+    # ------------------------------------------------------------------
+    def _check(self):
+        required = {
             "S3_ENDPOINT_URL": S3_ENDPOINT_URL,
             "S3_ACCESS_KEY": S3_ACCESS_KEY,
             "S3_SECRET_KEY": S3_SECRET_KEY,
             "S3_BUCKET_NAME": S3_BUCKET_NAME,
         }
-        
-        missing = [name for name, value in required_vars.items() if not value]
-        
+        missing = [k for k, v in required.items() if not v]
         if missing:
-            print(f"[S3Storage] Not configured. Missing: {missing}")
+            logger.warning(f"S3 not configured — missing: {missing}")
             self._configured = False
         else:
             self._configured = True
-            print(f"[S3Storage] Configured for bucket: {S3_BUCKET_NAME}")
-    
+            logger.info(f"S3 configured — bucket={S3_BUCKET_NAME}")
+
     @property
     def is_configured(self) -> bool:
         return self._configured
-    
+
     @property
     def client(self):
-        """Lazy initialization of S3 client."""
         if self._client is None:
             if not self._configured:
-                missing = []
-                if not S3_ENDPOINT_URL:
-                    missing.append("S3_ENDPOINT_URL")
-                if not S3_ACCESS_KEY:
-                    missing.append("S3_ACCESS_KEY")
-                if not S3_SECRET_KEY:
-                    missing.append("S3_SECRET_KEY")
-                if not S3_BUCKET_NAME:
-                    missing.append("S3_BUCKET_NAME")
-                raise S3NotConfiguredException(missing)
-            
+                missing = [k for k, v in {
+                    "S3_ENDPOINT_URL": S3_ENDPOINT_URL,
+                    "S3_ACCESS_KEY": S3_ACCESS_KEY,
+                    "S3_SECRET_KEY": S3_SECRET_KEY,
+                    "S3_BUCKET_NAME": S3_BUCKET_NAME,
+                }.items() if not v]
+                raise S3NotConfiguredError(missing)
             try:
                 self._client = boto3.client(
                     "s3",
@@ -187,798 +223,791 @@ class S3Storage:
                     aws_secret_access_key=S3_SECRET_KEY,
                     region_name=S3_REGION,
                 )
-            except Exception as e:
-                raise S3CredentialsException(str(e))
-        
+            except Exception as exc:
+                raise S3UploadError("(client-init)", str(exc))
         return self._client
-    
-    def upload_file(
+
+    # ------------------------------------------------------------------
+    def key(self, request_id: str, filename: str) -> str:
+        return f"{S3_KEY_PREFIX}/{request_id}/{filename}"
+
+    def upload(
         self,
-        file_path: str,
-        key: str,
-        content_type: str = "audio/ogg",
-        presigned_expiry: int = 60*60*24,  # 1 day in seconds
+        local_path: str,
+        request_id: str,
+        filename: str,
+        content_type: str = "application/octet-stream",
     ) -> str:
-        """
-        Upload a file to S3 and return a downloadable URL.
-        
-        Args:
-            file_path: Local file path to upload
-            key: S3 object key (path in bucket)
-            content_type: MIME type of the file
-            presigned_expiry: Expiry time for presigned URL in seconds (default: 7 days)
-        
-        Returns:
-            Downloadable URL (presigned URL or custom public URL)
-        
-        Raises:
-            S3CredentialsException, S3BucketException, S3UploadException
-        """
+        """Upload a local file and return the R2 object key."""
+        obj_key = self.key(request_id, filename)
         try:
             self.client.upload_file(
-                Filename=file_path,
+                Filename=local_path,
                 Bucket=S3_BUCKET_NAME,
-                Key=key,
-                ExtraArgs={
-                    "ContentType": content_type,
-                },
+                Key=obj_key,
+                ExtraArgs={"ContentType": content_type},
             )
-            
-            # Generate downloadable URL
-            if S3_PUBLIC_URL:
-                # Use custom public URL prefix (CDN, custom domain, etc.)
-                url = f"{S3_PUBLIC_URL.rstrip('/')}/{key}"
-            else:
-                # Generate presigned URL for direct download
-                url = self.client.generate_presigned_url(
-                    "get_object",
-                    Params={
-                        "Bucket": S3_BUCKET_NAME,
-                        "Key": key,
-                    },
-                    ExpiresIn=presigned_expiry,
-                )
-            
-            print(f"[S3Storage] Uploaded: {key}")
-            return url
-            
+            logger.debug(f"S3 uploaded: {obj_key} ({os.path.getsize(local_path)} bytes)")
+            return obj_key
         except NoCredentialsError:
-            raise S3CredentialsException("No credentials provided")
-        except PartialCredentialsError as e:
-            raise S3CredentialsException(f"Incomplete credentials: {e}")
-        except EndpointConnectionError as e:
-            raise S3BucketException(S3_BUCKET_NAME, f"Cannot connect to endpoint: {e}")
-        except ClientError as e:
-            error_code = e.response.get("Error", {}).get("Code", "Unknown")
-            error_msg = e.response.get("Error", {}).get("Message", str(e))
-            
-            if error_code in ("AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
-                raise S3CredentialsException(f"{error_code}: {error_msg}")
-            elif error_code in ("NoSuchBucket", "InvalidBucketName"):
-                raise S3BucketException(S3_BUCKET_NAME, f"{error_code}: {error_msg}")
-            else:
-                raise S3UploadException(key, f"{error_code}: {error_msg}")
-        except Exception as e:
-            raise S3UploadException(key, str(e))
-    
-    def generate_key(self, request_id: str, filename: str) -> str:
-        """
-        Generate S3 key for the new structure.
-        Format: worker-rvc-nano/request-{request_id}/{filename}
-        """
-        return f"worker-rvc-nano/request-{request_id}/{filename}"
-    
-    def get_request_folder_url(self, request_id: str) -> str:
-        """Get the public URL for a request's folder."""
-        key_prefix = f"worker-rvc-nano/request-{request_id}/"
+            raise S3UploadError(obj_key, "No credentials")
+        except PartialCredentialsError as exc:
+            raise S3UploadError(obj_key, f"Partial credentials: {exc}")
+        except EndpointConnectionError as exc:
+            raise S3UploadError(obj_key, f"Endpoint unreachable: {exc}")
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "Unknown")
+            msg = exc.response.get("Error", {}).get("Message", str(exc))
+            raise S3UploadError(obj_key, f"{code}: {msg}")
+        except Exception as exc:
+            raise S3UploadError(obj_key, str(exc))
+
+    def presigned_url(self, obj_key: str) -> str:
+        """Generate a presigned GET URL (or use public URL prefix)."""
         if S3_PUBLIC_URL:
-            return f"{S3_PUBLIC_URL.rstrip('/')}/{key_prefix}"
-        else:
-            return f"{S3_ENDPOINT_URL.rstrip('/')}/{S3_BUCKET_NAME}/{key_prefix}"
-    
-    def upload_input_audio(self, file_path: str, request_id: str) -> str:
-        """Upload input audio as input.opus.ogg."""
-        key = self.generate_key(request_id, "input.opus.ogg")
-        return self.upload_file(file_path, key, "audio/ogg")
-    
-    def upload_output_audio(self, file_path: str, request_id: str) -> str:
-        """Upload output audio as output.opus.ogg."""
-        key = self.generate_key(request_id, "output.opus.ogg")
-        return self.upload_file(file_path, key, "audio/ogg")
-    
-    def upload_metadata(self, metadata_json: str, request_id: str) -> str:
-        """Upload metadata as metadata.json."""
-        import tempfile
-        
-        key = self.generate_key(request_id, "metadata.json")
-        
-        # Write metadata to temp file
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            f.write(metadata_json)
-            temp_path = f.name
-        
-        try:
-            url = self.upload_file(temp_path, key, "application/json")
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-        
-        return url
-
-
-# Initialize global S3 storage
-S3 = S3Storage()
-
-
-# =============================================================================
-# Timing Context Manager
-# =============================================================================
-class Timer:
-    """Context manager for timing code blocks."""
-    
-    def __init__(self):
-        self.elapsed: float = 0.0
-    
-    def __enter__(self):
-        self.start = time.perf_counter()
-        return self
-    
-    def __exit__(self, *args):
-        self.elapsed = time.perf_counter() - self.start
-
-
-# =============================================================================
-# Model Handler
-# =============================================================================
-class ModelHandler:
-    """
-    Manages RVC model loading and caching with proper exception handling.
-    """
-    
-    def __init__(self):
-        self.rvc: Optional[RVCInference] = None
-        self.current_model_hash: Optional[str] = None
-        self.current_model_info: Optional[ModelInfo] = None
-        self._init_rvc()
-    
-    def _init_rvc(self):
-        """Initialize RVC inference engine with base models."""
-        print("[ModelHandler] Initializing RVC inference engine...")
-        try:
-            self.rvc = RVCInference(
-                device="cuda:0",
-                is_half=True,
-                hubert_path=HUBERT_PATH,
-                rmvpe_path=RMVPE_PATH,
-            )
-            print("[ModelHandler] RVC engine initialized successfully")
-        except FileNotFoundError as e:
-            raise ModelCorruptedException(str(e), "Base model files not found")
-        except Exception as e:
-            if "CUDA" in str(e) or "cuda" in str(e):
-                raise CUDAOutOfMemoryException()
-            raise ModelLoadException("base_models", str(e))
-    
-    def _get_file_hash(self, url: str) -> str:
-        """Generate a hash for the URL to use as cache key."""
-        return hashlib.md5(url.encode()).hexdigest()[:16]
-    
-    def _download_file(
-        self, 
-        url: str, 
-        cache_dir: str, 
-        prefix: str = "",
-        resource_type: str = "file",
-    ) -> Tuple[str, bool, float]:
-        """
-        Download a file from URL with caching and proper error handling.
-        Uses requests library for better compatibility (User-Agent, redirects, etc.)
-        Returns: (file_path, cache_hit, download_time)
-        Raises: DownloadException subclasses
-        """
-        import requests
-        from requests.exceptions import (
-            ConnectionError as RequestsConnectionError,
-            Timeout as RequestsTimeout,
-            HTTPError as RequestsHTTPError,
+            return f"{S3_PUBLIC_URL.rstrip('/')}/{obj_key}"
+        return self.client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET_NAME, "Key": obj_key},
+            ExpiresIn=S3_PRESIGNED_EXPIRY,
         )
-        
-        os.makedirs(cache_dir, exist_ok=True)
-        
-        # Extract extension from URL path (before query string)
-        url_path = url.split("?")[0]
-        extension = os.path.splitext(url_path)[-1] or ".bin"
-        
-        url_hash = self._get_file_hash(url)
-        cached_path = os.path.join(cache_dir, f"{prefix}{url_hash}{extension}")
-        
-        if os.path.exists(cached_path):
-            print(f"[ModelHandler] Cache hit: {cached_path}")
-            return cached_path, True, 0.0
-        
-        print(f"[ModelHandler] Downloading: {url}")
-        
-        # Headers for better compatibility with various hosts
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "*/*",
-            "Accept-Encoding": "gzip, deflate",
-        }
-        
-        try:
-            with Timer() as t:
-                response = requests.get(
-                    url,
-                    headers=headers,
-                    stream=True,
-                    timeout=DOWNLOAD_TIMEOUT,
-                    allow_redirects=True,
-                )
-                response.raise_for_status()
-                
-                # Get total size for progress logging
-                total_size = int(response.headers.get("content-length", 0))
-                downloaded_size = 0
-                
-                with open(cached_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded_size += len(chunk)
-                
-                # Log download info
-                if total_size > 0:
-                    print(f"[ModelHandler] Downloaded {downloaded_size / 1024 / 1024:.2f}MB")
-            
-            if not os.path.exists(cached_path):
-                raise DownloadedFileCorruptException(url, resource_type, "File not created")
-            
-            if os.path.getsize(cached_path) == 0:
-                os.remove(cached_path)
-                raise DownloadedFileCorruptException(url, resource_type, "Downloaded file is empty")
-            
-            print(f"[ModelHandler] Downloaded: {cached_path} ({t.elapsed:.2f}s)")
-            return cached_path, False, t.elapsed
-            
-        except RequestsHTTPError as e:
-            if os.path.exists(cached_path):
-                os.remove(cached_path)
-            status_code = e.response.status_code if e.response is not None else 0
-            if status_code == 404:
-                raise URLNotFoundException(url, resource_type)
-            elif status_code == 403:
-                raise URLForbiddenException(url)
-            else:
-                raise URLNotReachableException(url, f"HTTP {status_code}: {str(e)}")
-        
-        except RequestsTimeout:
-            if os.path.exists(cached_path):
-                os.remove(cached_path)
-            raise DownloadTimeoutException(url, DOWNLOAD_TIMEOUT)
-        
-        except RequestsConnectionError as e:
-            if os.path.exists(cached_path):
-                os.remove(cached_path)
-            raise URLNotReachableException(url, f"Connection error: {str(e)}")
-        
-        except Exception as e:
-            if os.path.exists(cached_path):
-                os.remove(cached_path)
-            if isinstance(e, DownloadException):
-                raise
-            raise URLNotReachableException(url, str(e))
-    
-    def load_model(self, model_url: str, metadata: InferenceMetadata) -> ModelInfo:
-        """Load RVC model from URL with caching and metadata tracking."""
-        model_hash = self._get_file_hash(model_url)
-        cache_hit = self.current_model_hash == model_hash
-        
-        model_info = ModelInfo(url=model_url, file_hash=model_hash, cached=cache_hit)
-        
-        if cache_hit:
-            print(f"[ModelHandler] Model already loaded: {model_hash}")
-            if self.current_model_info:
-                model_info.version = self.current_model_info.version
-                model_info.has_f0 = self.current_model_info.has_f0
-                model_info.target_sample_rate = self.current_model_info.target_sample_rate
-            metadata.resources.model_cache_hit = True
-            return model_info
-        
-        model_path, _, download_time = self._download_file(
-            model_url, MODEL_CACHE_DIR, prefix="model_", resource_type="model"
-        )
-        metadata.timing.download_model_seconds = download_time
-        
-        try:
-            with Timer() as t:
-                self.rvc.load_model(model_path)
-            metadata.timing.load_model_seconds = t.elapsed
-            
-        except FileNotFoundError:
-            raise ModelCorruptedException(model_path, "Model file not found after download")
-        except KeyError as e:
-            raise InvalidModelFileException(model_path, f"Missing required key: {e}")
-        except RuntimeError as e:
-            error_msg = str(e).lower()
-            if "size mismatch" in error_msg:
-                raise InvalidModelFileException(model_path, "Model weight size mismatch")
-            elif "cuda" in error_msg or "out of memory" in error_msg:
-                raise CUDAOutOfMemoryException()
-            raise ModelLoadException(model_path, str(e))
-        except Exception as e:
-            raise ModelLoadException(model_path, str(e))
-        
-        model_info.version = self.rvc.version
-        model_info.has_f0 = bool(self.rvc.if_f0)
-        model_info.target_sample_rate = self.rvc.tgt_sr
-        
-        self.current_model_hash = model_hash
-        self.current_model_info = model_info
-        
-        print(f"[ModelHandler] Model loaded: {model_hash} (v{model_info.version})")
-        return model_info
-    
-    def download_vocal(self, vocal_url: str, metadata: InferenceMetadata) -> Tuple[str, AudioInfo]:
-        """Download input vocal audio from URL."""
-        audio_path, cache_hit, download_time = self._download_file(
-            vocal_url, AUDIO_CACHE_DIR, prefix="vocal_", resource_type="vocal audio"
-        )
-        
-        metadata.timing.download_vocal_seconds = download_time
-        metadata.resources.vocal_cache_hit = cache_hit
-        
-        audio_info = AudioInfo(url=vocal_url, file_path=audio_path)
-        
-        try:
-            info = sf.info(audio_path)
-            audio_info.duration_seconds = info.duration
-            audio_info.sample_rate = info.samplerate
-            audio_info.channels = info.channels
-            audio_info.format = info.format
-            audio_info.file_size_bytes = os.path.getsize(audio_path)
-            
-        except sf.LibsndfileError as e:
-            raise AudioCorruptedException(audio_path, f"Cannot read audio: {e}")
-        except Exception as e:
-            raise InvalidAudioFormatException(audio_path, str(e))
-        
-        if audio_info.duration_seconds < MIN_AUDIO_DURATION:
-            raise AudioTooShortException(audio_info.duration_seconds, MIN_AUDIO_DURATION)
-        
-        return audio_path, audio_info
-    
-    def download_index(self, index_url: str, metadata: InferenceMetadata) -> str:
-        """Download index file from URL."""
-        index_path, cache_hit, download_time = self._download_file(
-            index_url, MODEL_CACHE_DIR, prefix="index_", resource_type="index"
-        )
-        
-        metadata.timing.download_index_seconds = download_time
-        metadata.resources.index_cache_hit = cache_hit
-        
-        if not index_path.endswith(".index") and os.path.getsize(index_path) < 1000:
-            raise InvalidIndexFileException(index_path, "File appears to be invalid or too small")
-        
-        return index_path
 
-
-# Initialize global model handler
-MODELS = ModelHandler()
-
-
-# =============================================================================
-# Audio Processing
-# =============================================================================
-def encode_to_opus_ogg(
-    audio_data: np.ndarray,
-    input_sample_rate: int,
-    output_path: str,
-    bitrate: str = OUTPUT_BITRATE,
-    sample_rate: int = OUTPUT_SAMPLE_RATE,
-) -> None:
-    """
-    Encode audio data to Opus/OGG format using ffmpeg.
-    Raises: FFmpegNotAvailableException, FFmpegEncodingException
-    """
-    import tempfile
-    
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True,
-            timeout=5,
-        )
-        if result.returncode != 0:
-            raise FFmpegNotAvailableException()
-    except FileNotFoundError:
-        raise FFmpegNotAvailableException()
-    except Exception:
-        raise FFmpegNotAvailableException()
-    
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+    def upload_json(self, data: str, request_id: str, filename: str) -> str:
+        """Write JSON string to a temp file, upload, return key."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
+            tmp.write(data)
             tmp_path = tmp.name
-            sf.write(tmp_path, audio_data, input_sample_rate)
-    except Exception as e:
-        raise OutputWriteException(tmp_path, f"Failed to write temp WAV: {e}")
-    
+        try:
+            return self.upload(tmp_path, request_id, filename, "application/json")
+        finally:
+            _safe_remove(tmp_path)
+
+
+# Global S3 instance
+s3 = S3Storage()
+
+
+# =============================================================================
+# RVC Engine — global singleton
+# =============================================================================
+logger.info("Initializing RVC inference engine …")
+try:
+    rvc_engine = RVCInference(
+        device="cuda:0",
+        is_half=True,
+        hubert_path=HUBERT_PATH,
+        rmvpe_path=RMVPE_PATH,
+    )
+    logger.info("RVC engine ready")
+except Exception as exc:
+    logger.critical(f"RVC engine init failed: {exc}")
+    raise
+
+_current_model_hash: Optional[str] = None
+
+
+# =============================================================================
+# Utility helpers
+# =============================================================================
+def _safe_remove(path: str):
     try:
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", tmp_path,
-            "-c:a", "libopus",
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _url_hash(url: str) -> str:
+    return hashlib.md5(url.encode()).hexdigest()[:16]
+
+
+def _ext_from_url(url: str) -> str:
+    """Extract file extension from a normal URL (ignoring query string)."""
+    path = url.split("?")[0]
+    ext = os.path.splitext(path)[-1]
+    return ext if ext else ".bin"
+
+
+def _ext_from_data_url(data_url: str) -> str:
+    """Extract file extension from a data:audio/...;base64,... URL."""
+    m = re.match(r"data:([^;,]+)", data_url)
+    if not m:
+        return ".bin"
+    mime = m.group(1).lower()
+    return MIME_TO_EXT.get(mime, ".bin")
+
+
+def _content_type(ext: str) -> str:
+    mapping = {v: k for k, v in MIME_TO_EXT.items()}
+    return mapping.get(ext, "application/octet-stream")
+
+
+# =============================================================================
+# FFmpeg / FFprobe helpers
+# =============================================================================
+def _check_ffmpeg():
+    """Raise FFmpegNotAvailableError if ffmpeg is missing."""
+    try:
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
+        if r.returncode != 0:
+            raise FFmpegNotAvailableError()
+    except FileNotFoundError:
+        raise FFmpegNotAvailableError()
+
+
+def probe_audio(path: str) -> Optional[Dict[str, Any]]:
+    """Return audio stream info via ffprobe, or None on failure."""
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-print_format", "json",
+        "-show_format", "-show_streams",
+        "-select_streams", "a:0",
+        path,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return None
+        data = json.loads(r.stdout)
+        stream = (data.get("streams") or [{}])[0]
+        fmt = data.get("format", {})
+        return {
+            "duration": float(fmt.get("duration", stream.get("duration", 0))),
+            "sample_rate": int(stream.get("sample_rate", 0)),
+            "channels": int(stream.get("channels", 0)),
+            "codec_name": stream.get("codec_name", ""),
+            "bit_rate": fmt.get("bit_rate", stream.get("bit_rate", "")),
+        }
+    except Exception:
+        return None
+
+
+def convert_to_wav(input_path: str, output_path: str):
+    """Convert any audio to mono PCM WAV (preserve original sample rate)."""
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-c:a", "pcm_s16le", "-ac", "1", "-vn",
+        output_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise InvalidAudioError(f"WAV conversion failed: {r.stderr[:300]}")
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise InvalidAudioError("WAV conversion produced empty output")
+
+
+def encode_audio(
+    wav_path: str,
+    output_path: str,
+    fmt: str,
+    bitrate: str,
+    sample_rate: int,
+):
+    """Encode WAV to the requested output format via ffmpeg."""
+    fmt_info = SUPPORTED_FORMATS[fmt]
+    codec = fmt_info["ffmpeg_codec"]
+
+    cmd = ["ffmpeg", "-y", "-i", wav_path]
+
+    if fmt in LOSSLESS_FORMATS:
+        # WAV / FLAC — bitrate is meaningless
+        cmd += ["-c:a", codec, "-ar", str(sample_rate), "-ac", "1", "-vn", output_path]
+    else:
+        cmd += [
+            "-c:a", codec,
             "-b:a", bitrate,
             "-ar", str(sample_rate),
             "-ac", "1",
             "-vn",
-            output_path
+            output_path,
         ]
-        
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        
-        if result.returncode != 0:
-            raise FFmpegEncodingException(
-                f"FFmpeg exited with code {result.returncode}",
-                stderr=result.stderr
-            )
-        
-        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            raise FFmpegEncodingException("Output file not created or empty")
-            
-    except subprocess.TimeoutExpired:
-        raise FFmpegEncodingException("FFmpeg encoding timed out")
-    except FFmpegEncodingException:
-        raise
-    except Exception as e:
-        raise FFmpegEncodingException(str(e))
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
 
-
-def analyze_audio(audio_data: np.ndarray, sample_rate: int) -> AudioInfo:
-    """Analyze audio and create AudioInfo."""
-    duration = len(audio_data) / sample_rate
-    peak = float(np.abs(audio_data).max())
-    rms = float(np.sqrt(np.mean(audio_data.astype(np.float64) ** 2)))
-    
-    return AudioInfo(
-        duration_seconds=duration,
-        sample_rate=sample_rate,
-        channels=1,
-        peak_amplitude=peak,
-        rms_level=rms,
-    )
-
-
-def save_and_upload_audio(
-    audio_data: np.ndarray,
-    sample_rate: int,
-    job_id: str,
-    metadata: InferenceMetadata,
-) -> Tuple[str, AudioInfo]:
-    """
-    Encode audio to Opus/OGG and upload to S3 or return as base64.
-    S3 structure: worker-rvc-nano/request-{request_id}/output.opus.ogg
-    Raises: EncodingException, UploadException
-    """
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    output_filename = f"output_{metadata.request_id}.{OUTPUT_FORMAT}"
-    audio_path = os.path.join(OUTPUT_DIR, output_filename)
-    
-    with Timer() as encode_timer:
-        encode_to_opus_ogg(audio_data, sample_rate, audio_path)
-    metadata.timing.encoding_seconds = encode_timer.elapsed
-    
-    file_size = os.path.getsize(audio_path)
-    
-    # Upload to S3 or encode to base64
-    with Timer() as upload_timer:
-        if S3.is_configured:
-            # Upload to S3 as output.opus.ogg
-            audio_url = S3.upload_output_audio(audio_path, metadata.request_id)
-        else:
-            # Fallback to base64
-            print("[save_and_upload_audio] S3 not configured, returning base64")
-            with open(audio_path, "rb") as audio_file:
-                audio_b64 = base64.b64encode(audio_file.read()).decode("utf-8")
-                audio_url = f"data:audio/{OUTPUT_FORMAT};base64,{audio_b64}"
-    
-    metadata.timing.upload_seconds = upload_timer.elapsed
-    
-    # Cleanup local file
-    if os.path.exists(audio_path):
-        os.remove(audio_path)
-    
-    # Create output audio info
-    audio_info = analyze_audio(audio_data, sample_rate)
-    audio_info.format = OUTPUT_FORMAT
-    audio_info.file_size_bytes = file_size
-    audio_info.sample_rate = OUTPUT_SAMPLE_RATE
-    
-    return audio_url, audio_info
-
-
-def encode_and_upload_input_audio(
-    input_audio_path: str,
-    metadata: InferenceMetadata,
-) -> Optional[str]:
-    """
-    Encode input audio to Opus/OGG and upload to S3.
-    S3 structure: worker-rvc-nano/request-{request_id}/input.opus.ogg
-    Returns: S3 URL or None if S3 is not configured
-    """
-    if not S3.is_configured:
-        return None
-    
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    encoded_input_path = os.path.join(OUTPUT_DIR, f"input_{metadata.request_id}.{OUTPUT_FORMAT}")
-    
-    try:
-        # Load input audio
-        import librosa
-        audio_data, sr = librosa.load(input_audio_path, sr=None, mono=True)
-        
-        # Encode to opus/ogg
-        encode_to_opus_ogg(audio_data, sr, encoded_input_path)
-        
-        # Upload to S3
-        input_url = S3.upload_input_audio(encoded_input_path, metadata.request_id)
-        
-        return input_url
-    except Exception as e:
-        print(f"[encode_and_upload_input_audio] Warning: Failed to upload input: {e}")
-        return None
-    finally:
-        if os.path.exists(encoded_input_path):
-            os.remove(encoded_input_path)
-
-
-def upload_metadata_to_s3(metadata: InferenceMetadata) -> Optional[str]:
-    """
-    Upload metadata.json to S3.
-    S3 structure: worker-rvc-nano/request-{request_id}/metadata.json
-    Returns: S3 URL or None if S3 is not configured
-    """
-    if not S3.is_configured:
-        return None
-    
-    try:
-        metadata_json = metadata.to_json()
-        metadata_url = S3.upload_metadata(metadata_json, metadata.request_id)
-        return metadata_url
-    except Exception as e:
-        print(f"[upload_metadata_to_s3] Warning: Failed to upload metadata: {e}")
-        return None
-
-
-def get_gpu_memory_usage() -> Tuple[Optional[float], Optional[float]]:
-    """Get current and peak GPU memory usage in MB."""
-    if not torch.cuda.is_available():
-        return None, None
-    try:
-        current = torch.cuda.memory_allocated() / 1024 / 1024
-        peak = torch.cuda.max_memory_allocated() / 1024 / 1024
-        return current, peak
-    except Exception:
-        return None, None
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if r.returncode != 0:
+        raise EncodingError(f"FFmpeg exited with code {r.returncode}", r.stderr)
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise EncodingError("Encoded output is empty or missing")
 
 
 # =============================================================================
-# Main Handler
+# GPU helpers
+# =============================================================================
+def _gpu_model() -> str:
+    if not torch.cuda.is_available():
+        return "N/A"
+    try:
+        return torch.cuda.get_device_name(0)
+    except Exception:
+        return "unknown"
+
+
+def _peak_vram_mb() -> float:
+    if not torch.cuda.is_available():
+        return 0.0
+    try:
+        return torch.cuda.max_memory_allocated(0) / (1024 * 1024)
+    except Exception:
+        return 0.0
+
+
+def _gpu_power_watts() -> float:
+    """Snapshot current GPU power draw via nvidia-smi."""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            return float(r.stdout.strip().split("\n")[0])
+    except Exception:
+        pass
+    return 0.0
+
+
+# =============================================================================
+# Download / decode helpers
+# =============================================================================
+def download_file(url: str, cache_dir: str, prefix: str = "") -> Tuple[str, float]:
+    """
+    Download a file from *url* into *cache_dir*.
+    Returns (local_path, elapsed_seconds).
+    Uses URL-hash caching so repeated downloads are free.
+    """
+    import requests
+    from requests.exceptions import (
+        ConnectionError as ReqConnError,
+        Timeout as ReqTimeout,
+        HTTPError as ReqHTTPError,
+    )
+
+    os.makedirs(cache_dir, exist_ok=True)
+    ext = _ext_from_url(url)
+    h = _url_hash(url)
+    cached = os.path.join(cache_dir, f"{prefix}{h}{ext}")
+
+    if os.path.exists(cached) and os.path.getsize(cached) > 0:
+        logger.debug(f"Cache hit: {cached}")
+        return cached, 0.0
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (RVC-Worker/2.0)",
+        "Accept": "*/*",
+    }
+
+    with Timer() as t:
+        try:
+            resp = requests.get(url, headers=headers, stream=True,
+                                timeout=DOWNLOAD_TIMEOUT, allow_redirects=True)
+            resp.raise_for_status()
+            size = 0
+            with open(cached, "wb") as fp:
+                for chunk in resp.iter_content(8192):
+                    if chunk:
+                        fp.write(chunk)
+                        size += len(chunk)
+            logger.info(f"Downloaded {size / 1024:.1f} KB → {cached} ({t.elapsed:.2f}s)")
+        except ReqHTTPError as exc:
+            _safe_remove(cached)
+            status = exc.response.status_code if exc.response is not None else 0
+            raise InputDownloadError(url, f"HTTP {status}")
+        except ReqTimeout:
+            _safe_remove(cached)
+            raise InputDownloadError(url, f"Timeout after {DOWNLOAD_TIMEOUT}s")
+        except ReqConnError as exc:
+            _safe_remove(cached)
+            raise InputDownloadError(url, f"Connection error: {exc}")
+        except Exception as exc:
+            _safe_remove(cached)
+            if isinstance(exc, RVCError):
+                raise
+            raise InputDownloadError(url, str(exc))
+
+    if not os.path.exists(cached) or os.path.getsize(cached) == 0:
+        _safe_remove(cached)
+        raise InputDownloadError(url, "Downloaded file is empty")
+
+    return cached, t.elapsed
+
+
+def decode_data_url(data_url: str, dest_dir: str, idx: int) -> str:
+    """Decode a data:audio/…;base64,… string to a local file. Returns path."""
+    m = re.match(r"data:([^;,]+);base64,(.+)", data_url, re.DOTALL)
+    if not m:
+        raise InvalidDataURLError("Cannot parse data URL (expected data:<mime>;base64,<data>)")
+    mime = m.group(1)
+    b64 = m.group(2)
+    ext = MIME_TO_EXT.get(mime.lower(), ".bin")
+
+    try:
+        raw = base64.b64decode(b64)
+    except Exception as exc:
+        raise InvalidDataURLError(f"Base64 decode failed: {exc}")
+
+    if len(raw) == 0:
+        raise InvalidDataURLError("Decoded audio data is empty")
+
+    os.makedirs(dest_dir, exist_ok=True)
+    path = os.path.join(dest_dir, f"data_{idx}{ext}")
+    with open(path, "wb") as fp:
+        fp.write(raw)
+
+    logger.info(f"Decoded data URL ({mime}) → {path} ({len(raw)} bytes)")
+    return path
+
+
+def download_or_decode(url: str, cache_dir: str, idx: int) -> str:
+    """Handle both normal URLs and data: URLs. Returns local file path."""
+    if url.startswith("data:"):
+        return decode_data_url(url, cache_dir, idx)
+    path, _ = download_file(url, cache_dir, prefix=f"input_{idx}_")
+    return path
+
+
+# =============================================================================
+# Input validation
+# =============================================================================
+def validate_input(job_input: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validate and normalise the raw job input.
+    Raises appropriate RVCError subclass on invalid input.
+    Returns a clean dict with all fields populated (defaults applied).
+    """
+    # --- required ---
+    if "input_urls" not in job_input:
+        raise MissingRequiredFieldError("input_urls")
+    if "model_url" not in job_input:
+        raise MissingRequiredFieldError("model_url")
+
+    input_urls = job_input["input_urls"]
+    if not isinstance(input_urls, list) or len(input_urls) == 0:
+        raise EmptyInputURLError()
+
+    model_url = job_input["model_url"]
+    if not isinstance(model_url, str) or not model_url.strip():
+        raise MissingRequiredFieldError("model_url")
+
+    # --- optional with defaults ---
+    index_url = job_input.get("index_url") or None
+    if index_url and not isinstance(index_url, str):
+        index_url = None
+
+    fmt = str(job_input.get("format", DEFAULT_FORMAT)).lower()
+    if fmt not in SUPPORTED_FORMATS:
+        raise FormatNotSupportedError(fmt, list(SUPPORTED_FORMATS.keys()))
+
+    bitrate = str(job_input.get("bitrate", DEFAULT_BITRATE)).lower()
+    if fmt not in LOSSLESS_FORMATS and bitrate not in SUPPORTED_BITRATES:
+        raise InvalidBitrateError(bitrate, SUPPORTED_BITRATES)
+
+    sample_rate = job_input.get("sample_rate", DEFAULT_SAMPLE_RATE)
+    try:
+        sample_rate = int(sample_rate)
+    except (TypeError, ValueError):
+        raise InvalidSampleRateError(sample_rate, SUPPORTED_SAMPLE_RATES)
+    if sample_rate not in SUPPORTED_SAMPLE_RATES:
+        raise InvalidSampleRateError(sample_rate, SUPPORTED_SAMPLE_RATES)
+
+    f0_up_key = job_input.get("f0_up_key", DEFAULT_F0_UP_KEY)
+    try:
+        f0_up_key = int(f0_up_key)
+    except (TypeError, ValueError):
+        raise InvalidF0UpKeyError(f0_up_key)
+    if not (-24 <= f0_up_key <= 24):
+        raise InvalidF0UpKeyError(f0_up_key)
+
+    index_rate = job_input.get("index_rate", DEFAULT_INDEX_RATE)
+    try:
+        index_rate = float(index_rate)
+    except (TypeError, ValueError):
+        raise InvalidIndexRateError(index_rate)
+    if not (0.0 <= index_rate <= 1.0):
+        raise InvalidIndexRateError(index_rate)
+
+    return {
+        "input_urls": input_urls,
+        "model_url": model_url,
+        "index_url": index_url,
+        "f0_up_key": f0_up_key,
+        "index_rate": index_rate,
+        "format": fmt,
+        "bitrate": bitrate,
+        "sample_rate": sample_rate,
+    }
+
+
+# =============================================================================
+# Main handler
 # =============================================================================
 @torch.inference_mode()
 def convert_voice(job: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    RunPod handler for RVC voice conversion.
-    Fixed: f0_method=rmvpe, output=opus/ogg/128kbps
-    """
-    import json
-    import pprint
-    
+    global _current_model_hash
+
     job_id = job.get("id", "unknown")
     job_input = job.get("input", {})
-    
-    # Initialize metadata with UUID7
-    metadata = InferenceMetadata.create(
-        job_id=job_id,
-        tag=job_input.get("tag"),
+
+    # --- init bookkeeping ---
+    request_id = generate_uuid7()
+    started_at = datetime.now(timezone.utc).isoformat()
+    _list_handler.reset()
+    torch.cuda.reset_peak_memory_stats()
+
+    perf = PerformanceInfo()
+    files_debug = FilesDebugInfo()
+    metadata = Metadata(
+        request=job_input,
+        debug=DebugInfo(
+            trace=TraceInfo(request_id=request_id, started_at=started_at),
+            performance=perf,
+            files=files_debug,
+        ),
     )
-    metadata.started_at = datetime.utcnow().isoformat() + "Z"
-    
-    total_timer = Timer()
-    total_timer.__enter__()
-    
-    # -------------------------------------------------------------------------
-    # Logging
-    # -------------------------------------------------------------------------
-    print(f"[convert_voice] Job started | request_id={metadata.request_id} | tag={metadata.tag}")
-    print("[convert_voice] Input:")
-    try:
-        print(json.dumps(job_input, indent=2, default=str), flush=True)
-    except Exception:
-        pprint.pprint(job_input, depth=4)
-    
-    # -------------------------------------------------------------------------
-    # Input Validation
-    # -------------------------------------------------------------------------
-    try:
-        validated_input = validate(job_input, INPUT_SCHEMA)
-        
-        if "errors" in validated_input:
-            errors = validated_input["errors"]
-            raise ValidationException(str(errors))
-        
-        job_input = validated_input["validated_input"]
-        
-    except ValidationException as e:
-        print(f"[convert_voice] Validation error: {e}", flush=True)
-        metadata.error = ErrorInfo(
-            error_type=type(e).__name__,
-            error_message=e.message,
-            error_stage=e.error_stage,
+
+    logger.info(f"=== Job started | job_id={job_id} | request_id={request_id} ===")
+    logger.info(f"Input payload: {json.dumps(job_input, default=str)[:1000]}")
+
+    def _finalise(response: Dict[str, Any]) -> Dict[str, Any]:
+        """Write metadata and return response."""
+        metadata.debug.trace.ended_at = datetime.now(timezone.utc).isoformat()
+        metadata.debug.resource = ResourceInfo(
+            gpu_model=_gpu_model(),
+            peak_vram=round(_peak_vram_mb(), 2),
+            peak_power=round(_gpu_power_watts(), 2),
         )
-        metadata.success = False
-        return create_error_output(e.message, metadata)
-    except Exception as e:
-        print(f"[convert_voice] Validation exception: {e}", flush=True)
-        metadata.error = ErrorInfo(
-            error_type="ValidationError",
-            error_message=str(e),
-            error_stage="input_validation",
-            stack_trace=traceback.format_exc(),
-        )
-        metadata.success = False
-        return create_error_output(str(e), metadata)
-    
-    # Store input params
-    metadata.input_params = {
-        "f0_up_key": job_input["f0_up_key"],
-        "index_rate": job_input["index_rate"],
-    }
-    metadata.index_url = job_input.get("index_url")
-    
-    # -------------------------------------------------------------------------
-    # Process Request with Structured Exception Handling
-    # -------------------------------------------------------------------------
+        metadata.response = response
+        metadata.debug.logs = _list_handler.snapshot()
+
+        # Upload metadata to S3
+        if s3.is_configured:
+            try:
+                s3.upload_json(metadata.to_json(), request_id, "metadata.json")
+                logger.info("Metadata uploaded to S3")
+            except Exception as exc:
+                logger.warning(f"Metadata upload failed: {exc}")
+
+        logger.info(f"=== Job finished | request_id={request_id} ===")
+        return response
+
+    # ─────────────────────────────────────────────────────────────────
+    # STAGE 0: Validate input
+    # ─────────────────────────────────────────────────────────────────
     try:
-        # Stage 1: Load model
-        model_info = MODELS.load_model(job_input["model_url"], metadata)
-        metadata.model_info = model_info
-        
-        # Stage 2: Download vocal
-        vocal_path, input_audio_info = MODELS.download_vocal(job_input["vocal_url"], metadata)
-        metadata.input_audio = input_audio_info
-        
-        # Stage 3: Download index if provided
-        index_path = ""
-        if job_input.get("index_url"):
-            index_path = MODELS.download_index(job_input["index_url"], metadata)
-        
-        # Stage 4: Run RVC inference
-        print(f"[convert_voice] Running inference | f0_method={F0_METHOD}")
-        
+        params = validate_input(job_input)
+    except RVCError as exc:
+        logger.error(f"Validation failed: {exc}")
+        return _finalise(build_fail_response(exc.code, str(exc)))
+
+    input_urls: List[str] = params["input_urls"]
+    model_url: str = params["model_url"]
+    index_url: Optional[str] = params["index_url"]
+    fmt: str = params["format"]
+    bitrate: str = params["bitrate"]
+    sample_rate: int = params["sample_rate"]
+    f0_up_key: int = params["f0_up_key"]
+    index_rate: float = params["index_rate"]
+
+    logger.info(f"Validated | inputs={len(input_urls)} | format={fmt} | bitrate={bitrate} | sr={sample_rate}")
+
+    # Ensure ffmpeg exists early
+    try:
+        _check_ffmpeg()
+    except FFmpegNotAvailableError as exc:
+        logger.critical("FFmpeg not found")
+        return _finalise(build_fail_response(exc.code, str(exc)))
+
+    # Prepare working directory for this request
+    work = os.path.join(WORK_DIR, request_id)
+    os.makedirs(work, exist_ok=True)
+
+    # ─────────────────────────────────────────────────────────────────
+    # STAGE 1: Download all files (model, index, inputs)
+    # ─────────────────────────────────────────────────────────────────
+    # Each input item tracks its state through the pipeline
+    items: List[Dict[str, Any]] = [
+        {"idx": i, "key": url, "error": None} for i, url in enumerate(input_urls)
+    ]
+
+    try:
+        with Timer() as dl_timer:
+            # Model
+            logger.info(f"Downloading model: {model_url[:120]}")
+            try:
+                model_path, _ = download_file(model_url, MODEL_CACHE_DIR, prefix="model_")
+            except Exception as exc:
+                raise ModelDownloadError(model_url, str(exc))
+
+            # Index
+            index_path: Optional[str] = None
+            if index_url:
+                logger.info(f"Downloading index: {index_url[:120]}")
+                try:
+                    index_path, _ = download_file(index_url, MODEL_CACHE_DIR, prefix="index_")
+                except Exception as exc:
+                    raise IndexDownloadError(index_url, str(exc))
+
+            # Inputs
+            for item in items:
+                url = item["key"]
+                try:
+                    logger.info(f"Downloading input [{item['idx']}]: {url[:120]}")
+                    item["input_path"] = download_or_decode(url, os.path.join(work, "inputs"), item["idx"])
+                except Exception as exc:
+                    logger.warning(f"Input [{item['idx']}] download failed: {exc}")
+                    item["error"] = f"Download failed: {exc}"
+
+        perf.download_file = round(dl_timer.elapsed, 4)
+        logger.info(f"Downloads complete ({dl_timer.elapsed:.2f}s)")
+
+    except RVCError as exc:
+        logger.error(f"Critical download failure: {exc}")
+        return _finalise(build_fail_response(exc.code, str(exc)))
+
+    # Upload model & index originals to R2
+    if s3.is_configured:
         try:
-            with Timer() as inference_timer:
-                sample_rate, audio_output = MODELS.rvc.infer(
-                    input_path=vocal_path,
-                    f0_up_key=job_input["f0_up_key"],
+            ext = _ext_from_url(model_url)
+            files_debug.model_key = s3.upload(model_path, request_id, f"model{ext}")
+        except Exception as exc:
+            logger.warning(f"Model upload to R2 failed: {exc}")
+        if index_path and index_url:
+            try:
+                ext = _ext_from_url(index_url)
+                files_debug.index_key = s3.upload(index_path, request_id, f"index{ext}")
+            except Exception as exc:
+                logger.warning(f"Index upload to R2 failed: {exc}")
+
+    # ─────────────────────────────────────────────────────────────────
+    # STAGE 2: Validate inputs & convert to WAV
+    # ─────────────────────────────────────────────────────────────────
+    with Timer() as val_timer:
+        for item in items:
+            if item["error"]:
+                continue
+            try:
+                in_path = item["input_path"]
+                info = probe_audio(in_path)
+                if info is None:
+                    raise InvalidAudioError("ffprobe could not read file")
+
+                duration = info["duration"]
+                if duration < MIN_AUDIO_DURATION:
+                    raise AudioTooShortError(duration, MIN_AUDIO_DURATION)
+
+                wav_path = os.path.join(work, f"{item['idx']}_input.wav")
+                convert_to_wav(in_path, wav_path)
+                item["wav_path"] = wav_path
+                logger.info(f"Input [{item['idx']}] validated: {duration:.2f}s, {info['sample_rate']}Hz")
+
+                # Upload original input to R2
+                if s3.is_configured:
+                    try:
+                        if item["key"].startswith("data:"):
+                            ext = _ext_from_data_url(item["key"])
+                        else:
+                            ext = _ext_from_url(item["key"])
+                        item["input_original_key"] = s3.upload(
+                            in_path, request_id, f"{item['idx']}_input{ext}",
+                        )
+                    except Exception as exc:
+                        logger.warning(f"Input [{item['idx']}] original upload failed: {exc}")
+
+            except RVCError as exc:
+                logger.warning(f"Input [{item['idx']}] validation failed: {exc}")
+                item["error"] = str(exc)
+            except Exception as exc:
+                logger.warning(f"Input [{item['idx']}] validation error: {exc}")
+                item["error"] = f"Validation error: {exc}"
+
+    perf.validate_input_file = round(val_timer.elapsed, 4)
+
+    # Check if any inputs survived
+    valid_items = [it for it in items if it.get("error") is None]
+    if not valid_items:
+        errors = [f"[{it['idx']}] {it['error']}" for it in items]
+        logger.error(f"All inputs failed validation: {errors}")
+        return _finalise(build_fail_response(
+            "ALL_INPUTS_FAILED",
+            f"All {len(items)} input(s) failed: {'; '.join(errors)}",
+        ))
+
+    # ─────────────────────────────────────────────────────────────────
+    # STAGE 3: Load RVC model
+    # ─────────────────────────────────────────────────────────────────
+    try:
+        with Timer() as mdl_timer:
+            model_hash = _url_hash(model_url)
+            if _current_model_hash == model_hash:
+                logger.info(f"Model already loaded (hash={model_hash})")
+            else:
+                logger.info(f"Loading model (hash={model_hash}) …")
+                rvc_engine.load_model(model_path)
+                _current_model_hash = model_hash
+                logger.info(f"Model loaded: v{rvc_engine.version}, tgt_sr={rvc_engine.tgt_sr}")
+        perf.load_model = round(mdl_timer.elapsed, 4)
+    except RuntimeError as exc:
+        msg = str(exc).lower()
+        if "cuda" in msg and "memory" in msg:
+            raise CUDAOutOfMemoryError()
+        logger.error(f"Model load failed: {exc}")
+        return _finalise(build_fail_response("MODEL_LOAD_FAILED", f"Failed to load model: {exc}"))
+    except Exception as exc:
+        logger.error(f"Model load failed: {exc}")
+        return _finalise(build_fail_response("MODEL_LOAD_FAILED", f"Failed to load model: {exc}"))
+
+    # ─────────────────────────────────────────────────────────────────
+    # STAGE 4: RVC inference (per input)
+    # ─────────────────────────────────────────────────────────────────
+    with Timer() as infer_timer:
+        for item in items:
+            if item.get("error"):
+                continue
+            try:
+                logger.info(f"Running inference [{item['idx']}] | f0={F0_METHOD} | key={f0_up_key}")
+                sr, audio_out = rvc_engine.infer(
+                    input_path=item["wav_path"],
+                    f0_up_key=f0_up_key,
                     f0_method=F0_METHOD,
-                    file_index=index_path,
-                    index_rate=job_input["index_rate"],
+                    file_index=index_path or "",
+                    index_rate=index_rate,
                     filter_radius=FILTER_RADIUS,
                     resample_sr=0,
                     rms_mix_rate=RMS_MIX_RATE,
                     protect=PROTECT,
                 )
-            metadata.timing.inference_seconds = inference_timer.elapsed
-            
-        except RuntimeError as e:
-            error_msg = str(e).lower()
-            if "cuda" in error_msg and "memory" in error_msg:
-                raise CUDAOutOfMemoryException()
-            elif "f0" in error_msg or "pitch" in error_msg:
-                raise PitchExtractionException(F0_METHOD, str(e))
-            elif "hubert" in error_msg or "feature" in error_msg:
-                raise FeatureExtractionException(str(e))
-            else:
-                raise VoiceConversionException(str(e))
-        except Exception as e:
-            if isinstance(e, InferenceException):
-                raise
-            raise VoiceConversionException(str(e))
-        
-        print(f"[convert_voice] Inference done | sr={sample_rate} | duration={len(audio_output)/sample_rate:.2f}s")
-        
-        # GPU metrics
-        current_mem, peak_mem = get_gpu_memory_usage()
-        metadata.resources.gpu_memory_used_mb = current_mem
-        metadata.resources.gpu_memory_peak_mb = peak_mem
-        
-        # Stage 5: Encode and upload output
-        audio_url, output_audio_info = save_and_upload_audio(
-            audio_output, sample_rate, job_id, metadata
+                # Save output WAV
+                out_wav = os.path.join(work, f"{item['idx']}_output.wav")
+                sf.write(out_wav, audio_out, sr)
+                item["output_wav"] = out_wav
+                item["output_sr"] = sr
+                logger.info(f"Inference [{item['idx']}] done: {len(audio_out)/sr:.2f}s @ {sr}Hz")
+
+                # Upload output WAV to R2
+                if s3.is_configured:
+                    try:
+                        item["output_original_key"] = s3.upload(
+                            out_wav, request_id, f"{item['idx']}_output.wav", "audio/wav",
+                        )
+                    except Exception as exc:
+                        logger.warning(f"Output WAV [{item['idx']}] upload failed: {exc}")
+
+            except RuntimeError as exc:
+                msg = str(exc).lower()
+                if "cuda" in msg and "memory" in msg:
+                    logger.error(f"CUDA OOM during inference [{item['idx']}]")
+                    item["error"] = "CUDA out of memory"
+                else:
+                    logger.error(f"Inference [{item['idx']}] failed: {exc}")
+                    item["error"] = f"Inference failed: {exc}"
+            except Exception as exc:
+                logger.error(f"Inference [{item['idx']}] failed: {exc}")
+                item["error"] = f"Inference failed: {exc}"
+
+    perf.convert_vocal = round(infer_timer.elapsed, 4)
+
+    # ─────────────────────────────────────────────────────────────────
+    # STAGE 5: Encode to target format
+    # ─────────────────────────────────────────────────────────────────
+    with Timer() as enc_timer:
+        for item in items:
+            if item.get("error"):
+                continue
+            try:
+                ext = SUPPORTED_FORMATS[fmt]["ext"]
+                encoded_path = os.path.join(work, f"{item['idx']}_output.{ext}")
+                logger.info(f"Encoding [{item['idx']}] → {fmt} / {bitrate} / {sample_rate}Hz")
+                encode_audio(item["output_wav"], encoded_path, fmt, bitrate, sample_rate)
+                item["encoded_path"] = encoded_path
+                logger.info(f"Encoded [{item['idx']}]: {os.path.getsize(encoded_path)} bytes")
+            except Exception as exc:
+                logger.error(f"Encoding [{item['idx']}] failed: {exc}")
+                item["error"] = f"Encoding failed: {exc}"
+
+    perf.encode_converted = round(enc_timer.elapsed, 4)
+
+    # ─────────────────────────────────────────────────────────────────
+    # STAGE 6: Upload encoded results & build response file entries
+    # ─────────────────────────────────────────────────────────────────
+    file_results: List[FileResult] = []
+
+    with Timer() as upl_timer:
+        for item in items:
+            if item.get("error"):
+                continue
+            try:
+                ext = SUPPORTED_FORMATS[fmt]["ext"]
+                ct = SUPPORTED_FORMATS[fmt]["content_type"]
+                r2_key = s3.upload(
+                    item["encoded_path"], request_id, f"{item['idx']}_output.{ext}", ct,
+                )
+                item["output_target_key"] = r2_key
+                presigned = s3.presigned_url(r2_key)
+
+                # Probe the encoded file for accurate metadata
+                info = probe_audio(item["encoded_path"]) or {}
+                file_results.append(FileResult(
+                    key=item["key"],
+                    size=os.path.getsize(item["encoded_path"]),
+                    format=fmt,
+                    codec=SUPPORTED_FORMATS[fmt]["codec"],
+                    channel=1,
+                    bitrate=bitrate if fmt not in LOSSLESS_FORMATS else "N/A",
+                    sample_rate=sample_rate,
+                    duration_sec=round(info.get("duration", 0), 2),
+                    url=presigned,
+                ))
+
+            except Exception as exc:
+                logger.error(f"Upload [{item['idx']}] failed: {exc}")
+                item["error"] = f"Upload failed: {exc}"
+
+    perf.upload_results = round(upl_timer.elapsed, 4)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Build debug.files.inputs
+    # ─────────────────────────────────────────────────────────────────
+    for item in items:
+        files_debug.inputs.append(InputFileDebug(
+            input_original_key=item.get("input_original_key", ""),
+            output_original_key=item.get("output_original_key", ""),
+            output_target_key=item.get("output_target_key", ""),
+        ))
+
+    # ─────────────────────────────────────────────────────────────────
+    # Build final response
+    # ─────────────────────────────────────────────────────────────────
+    total = len(items)
+    ok_count = len(file_results)
+    fail_count = total - ok_count
+
+    if ok_count == 0:
+        errors = [f"[{it['idx']}] {it.get('error', 'unknown')}" for it in items]
+        response = build_fail_response(
+            "ALL_INPUTS_FAILED",
+            f"All {total} input(s) failed: {'; '.join(errors)}",
         )
-        metadata.output_audio = output_audio_info
-        
-        # Stage 6: Upload input audio to S3 (optional, non-blocking)
-        input_s3_url = encode_and_upload_input_audio(vocal_path, metadata)
-        if input_s3_url:
-            metadata.input_audio.url = input_s3_url
-            print(f"[convert_voice] Input audio uploaded: {input_s3_url}")
-        
-        # Finalize timing
-        total_timer.__exit__(None, None, None)
-        metadata.timing.total_seconds = total_timer.elapsed
-        metadata.completed_at = datetime.utcnow().isoformat() + "Z"
-        metadata.success = True
-        
-        # Stage 7: Upload metadata.json to S3 (optional, non-blocking)
-        metadata_url = upload_metadata_to_s3(metadata)
-        if metadata_url:
-            print(f"[convert_voice] Metadata uploaded: {metadata_url}")
-        
-        print(f"[convert_voice] Completed | request_id={metadata.request_id} | "
-              f"total={metadata.timing.total_seconds:.2f}s | "
-              f"inference={metadata.timing.inference_seconds:.2f}s")
-        
-        # Log full metadata for analytics
-        print(f"[METADATA] {metadata.to_json()}")
-        
-        return create_success_output(audio_url, metadata, include_timing=True)
-    
-    # -------------------------------------------------------------------------
-    # Structured Exception Handling
-    # -------------------------------------------------------------------------
-    except RVCWorkerException as e:
-        print(f"[ERROR] {type(e).__name__}: {e}", flush=True)
-        metadata.error = ErrorInfo(
-            error_type=type(e).__name__,
-            error_message=e.message,
-            error_stage=e.error_stage,
-            stack_trace=traceback.format_exc() if not e.recoverable else None,
+    elif fail_count > 0:
+        response = build_fail_response(
+            "PARTIAL_INPUT_FAILED",
+            f"{fail_count}/{total} input(s) failed — returning {ok_count} successful result(s)",
+            file_results,
         )
-        metadata.success = False
-        
-        total_timer.__exit__(None, None, None)
-        metadata.timing.total_seconds = total_timer.elapsed
-        metadata.completed_at = datetime.utcnow().isoformat() + "Z"
-        print(f"[METADATA] {metadata.to_json()}")
-        
-        return create_error_output(
-            str(e),
-            metadata,
-            refresh_worker=not e.recoverable
-        )
-    
-    except Exception as e:
-        classified = classify_exception(e)
-        print(f"[ERROR] Unexpected {type(e).__name__}: {e}", flush=True)
-        traceback.print_exc()
-        
-        metadata.error = ErrorInfo(
-            error_type=type(e).__name__,
-            error_message=str(e),
-            error_stage=classified.error_stage,
-            stack_trace=traceback.format_exc(),
-        )
-        metadata.success = False
-        
-        total_timer.__exit__(None, None, None)
-        metadata.timing.total_seconds = total_timer.elapsed
-        metadata.completed_at = datetime.utcnow().isoformat() + "Z"
-        print(f"[METADATA] {metadata.to_json()}")
-        
-        return create_error_output(
-            str(e),
-            metadata,
-            refresh_worker=not classified.recoverable
-        )
+    else:
+        response = build_success_response(file_results)
+
+    logger.info(
+        f"Result: {ok_count}/{total} succeeded | "
+        f"perf: dl={perf.download_file:.2f}s val={perf.validate_input_file:.2f}s "
+        f"model={perf.load_model:.2f}s infer={perf.convert_vocal:.2f}s "
+        f"enc={perf.encode_converted:.2f}s upl={perf.upload_results:.2f}s"
+    )
+
+    # Cleanup working directory
+    try:
+        import shutil
+        shutil.rmtree(work, ignore_errors=True)
+    except Exception:
+        pass
+
+    return _finalise(response)
 
 
 # =============================================================================

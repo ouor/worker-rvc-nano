@@ -1,538 +1,305 @@
 """
-RVC Worker Custom Exceptions
+RVC Worker Exceptions (v2)
 
-Defines all possible exceptions that can occur during the RVC inference pipeline.
-Each exception includes:
-- error_stage: Which stage of the pipeline failed
-- recoverable: Whether the worker can continue processing other requests
-- http_status: Suggested HTTP status code for API responses
+Structured exception hierarchy with error codes.
+Each exception maps to a response `code` field for client consumption.
 """
 
-from typing import Optional
+from typing import Optional, List
 
 
-class RVCWorkerException(Exception):
-    """
-    Base exception for all RVC Worker errors.
-    """
-    error_stage: str = "unknown"
-    recoverable: bool = True
+# =============================================================================
+# Base Exception
+# =============================================================================
+
+class RVCError(Exception):
+    """Base exception for all RVC worker errors."""
+
+    code: str = "INTERNAL_ERROR"
     http_status: int = 500
-    
+    recoverable: bool = True
+
     def __init__(self, message: str, details: Optional[str] = None):
         self.message = message
         self.details = details
         super().__init__(message)
-    
+
     def __str__(self) -> str:
         if self.details:
-            return f"{self.message}: {self.details}"
+            return f"{self.message} — {self.details}"
         return self.message
 
 
 # =============================================================================
-# Input Validation Exceptions
+# Input Validation
 # =============================================================================
 
-class ValidationException(RVCWorkerException):
-    """Base class for input validation errors."""
-    error_stage = "input_validation"
-    recoverable = True
+class ValidationError(RVCError):
+    """Base for input validation errors."""
+    code = "VALIDATION_ERROR"
     http_status = 400
 
 
-class MissingRequiredFieldException(ValidationException):
-    """Required field is missing from input."""
-    
+class MissingRequiredFieldError(ValidationError):
+    code = "MISSING_REQUIRED_FIELD"
+
     def __init__(self, field_name: str):
         super().__init__(
-            message=f"Missing required field: {field_name}",
-            details=f"The field '{field_name}' is required but was not provided"
+            f"Missing required field: {field_name}",
+            f"The field '{field_name}' is required but was not provided",
         )
         self.field_name = field_name
 
 
-class InvalidFieldTypeException(ValidationException):
-    """Field has wrong type."""
-    
-    def __init__(self, field_name: str, expected_type: str, actual_type: str):
+class EmptyInputURLError(ValidationError):
+    code = "EMPTY_INPUT_URL"
+
+    def __init__(self):
         super().__init__(
-            message=f"Invalid type for field '{field_name}'",
-            details=f"Expected {expected_type}, got {actual_type}"
+            "At least 1 valid url is required",
+            "input_urls must be a non-empty list of URLs or data URLs",
         )
-        self.field_name = field_name
-        self.expected_type = expected_type
-        self.actual_type = actual_type
 
 
-class FieldConstraintException(ValidationException):
-    """Field value violates constraints."""
-    
-    def __init__(self, field_name: str, constraint: str, value: any):
+class FormatNotSupportedError(ValidationError):
+    code = "FORMAT_NOT_SUPPORTED"
+
+    def __init__(self, fmt: str, supported: List[str]):
         super().__init__(
-            message=f"Constraint violation for field '{field_name}'",
-            details=f"Value {value} violates constraint: {constraint}"
+            f"Format '{fmt}' is not supported",
+            f"Supported formats: {', '.join(supported)}",
         )
-        self.field_name = field_name
-        self.constraint = constraint
-        self.value = value
+        self.fmt = fmt
 
 
-class InvalidURLException(ValidationException):
-    """URL format is invalid."""
-    
-    def __init__(self, field_name: str, url: str):
+class InvalidBitrateError(ValidationError):
+    code = "INVALID_BITRATE"
+
+    def __init__(self, bitrate: str, supported: List[str]):
         super().__init__(
-            message=f"Invalid URL format for '{field_name}'",
-            details=f"URL: {url[:100]}..."
+            f"Bitrate '{bitrate}' is not supported",
+            f"Supported bitrates: {', '.join(supported)}",
         )
-        self.field_name = field_name
-        self.url = url
+        self.bitrate = bitrate
+
+
+class InvalidSampleRateError(ValidationError):
+    code = "INVALID_SAMPLE_RATE"
+
+    def __init__(self, sample_rate: int, supported: List[int]):
+        super().__init__(
+            f"Sample rate {sample_rate} is not supported",
+            f"Supported sample rates: {', '.join(map(str, supported))}",
+        )
+        self.sample_rate = sample_rate
+
+
+class InvalidF0UpKeyError(ValidationError):
+    code = "INVALID_F0_UP_KEY"
+
+    def __init__(self, value):
+        super().__init__(
+            f"f0_up_key must be an integer between -24 and 24",
+            f"Got: {value}",
+        )
+
+
+class InvalidIndexRateError(ValidationError):
+    code = "INVALID_INDEX_RATE"
+
+    def __init__(self, value):
+        super().__init__(
+            f"index_rate must be a float between 0.0 and 1.0",
+            f"Got: {value}",
+        )
+
+
+class InvalidDataURLError(ValidationError):
+    code = "INVALID_DATA_URL"
+
+    def __init__(self, reason: str):
+        super().__init__(
+            "Invalid data URL",
+            reason,
+        )
 
 
 # =============================================================================
-# Download Exceptions
+# Download
 # =============================================================================
 
-class DownloadException(RVCWorkerException):
-    """Base class for download errors."""
-    error_stage = "download"
-    recoverable = True
+class DownloadError(RVCError):
+    """Base for download errors."""
+    code = "DOWNLOAD_FAILED"
     http_status = 502
 
 
-class URLNotReachableException(DownloadException):
-    """Cannot reach the URL (network error)."""
-    
-    def __init__(self, url: str, reason: str = "Network error"):
+class ModelDownloadError(DownloadError):
+    code = "MODEL_DOWNLOAD_FAILED"
+
+    def __init__(self, url: str, reason: str):
         super().__init__(
-            message="Cannot reach URL",
-            details=f"{reason}: {url[:100]}..."
-        )
-        self.url = url
-        self.reason = reason
-
-
-class URLNotFoundException(DownloadException):
-    """URL returned 404."""
-    http_status = 404
-    
-    def __init__(self, url: str, resource_type: str = "file"):
-        super().__init__(
-            message=f"{resource_type.capitalize()} not found",
-            details=f"URL returned 404: {url[:100]}..."
-        )
-        self.url = url
-        self.resource_type = resource_type
-
-
-class URLForbiddenException(DownloadException):
-    """URL returned 403."""
-    http_status = 403
-    
-    def __init__(self, url: str):
-        super().__init__(
-            message="Access forbidden",
-            details=f"URL returned 403: {url[:100]}..."
+            "Failed to download model",
+            f"{reason} | url={url[:120]}",
         )
         self.url = url
 
 
-class DownloadTimeoutException(DownloadException):
-    """Download timed out."""
-    http_status = 504
-    
-    def __init__(self, url: str, timeout_seconds: float):
+class IndexDownloadError(DownloadError):
+    code = "INDEX_DOWNLOAD_FAILED"
+
+    def __init__(self, url: str, reason: str):
         super().__init__(
-            message="Download timeout",
-            details=f"Exceeded {timeout_seconds}s for {url[:100]}..."
+            "Failed to download index file",
+            f"{reason} | url={url[:120]}",
         )
         self.url = url
-        self.timeout_seconds = timeout_seconds
 
 
-class DownloadedFileCorruptException(DownloadException):
-    """Downloaded file is corrupted or invalid."""
-    
-    def __init__(self, url: str, file_type: str, reason: str):
+class InputDownloadError(DownloadError):
+    code = "INPUT_DOWNLOAD_FAILED"
+
+    def __init__(self, url_or_key: str, reason: str):
         super().__init__(
-            message=f"Downloaded {file_type} file is corrupted",
-            details=f"{reason}: {url[:100]}..."
+            "Failed to download input audio",
+            f"{reason} | key={url_or_key[:120]}",
         )
-        self.url = url
-        self.file_type = file_type
-        self.reason = reason
 
 
 # =============================================================================
-# Audio Processing Exceptions
+# Audio
 # =============================================================================
 
-class AudioException(RVCWorkerException):
-    """Base class for audio processing errors."""
-    error_stage = "audio_processing"
-    recoverable = True
+class AudioError(RVCError):
+    """Base for audio processing errors."""
+    code = "AUDIO_ERROR"
     http_status = 422
 
 
-class InvalidAudioFormatException(AudioException):
-    """Audio file format is not supported or invalid."""
-    
-    def __init__(self, file_path: str, detected_format: Optional[str] = None):
-        super().__init__(
-            message="Invalid or unsupported audio format",
-            details=f"Detected format: {detected_format or 'unknown'}"
-        )
-        self.file_path = file_path
-        self.detected_format = detected_format
+class InvalidAudioError(AudioError):
+    code = "INVALID_AUDIO"
 
-
-class AudioCorruptedException(AudioException):
-    """Audio file is corrupted and cannot be read."""
-    
-    def __init__(self, file_path: str, reason: str):
-        super().__init__(
-            message="Audio file is corrupted",
-            details=reason
-        )
-        self.file_path = file_path
-        self.reason = reason
-
-
-class AudioTooShortException(AudioException):
-    """Audio is too short for processing."""
-    
-    def __init__(self, duration_seconds: float, min_duration: float = 0.5):
-        super().__init__(
-            message="Audio is too short",
-            details=f"Duration {duration_seconds:.2f}s is less than minimum {min_duration}s"
-        )
-        self.duration_seconds = duration_seconds
-        self.min_duration = min_duration
-
-
-class AudioTooLongException(AudioException):
-    """Audio is too long for processing."""
-    
-    def __init__(self, duration_seconds: float, max_duration: float):
-        super().__init__(
-            message="Audio is too long",
-            details=f"Duration {duration_seconds:.2f}s exceeds maximum {max_duration}s"
-        )
-        self.duration_seconds = duration_seconds
-        self.max_duration = max_duration
-
-
-class AudioLoadException(AudioException):
-    """Failed to load audio file."""
-    
-    def __init__(self, file_path: str, reason: str):
-        super().__init__(
-            message="Failed to load audio",
-            details=reason
-        )
-        self.file_path = file_path
-        self.reason = reason
-
-
-# =============================================================================
-# Model Exceptions
-# =============================================================================
-
-class ModelException(RVCWorkerException):
-    """Base class for model-related errors."""
-    error_stage = "model_loading"
-    recoverable = True
-    http_status = 422
-
-
-class InvalidModelFileException(ModelException):
-    """Model file is not a valid RVC model."""
-    
-    def __init__(self, file_path: str, reason: str):
-        super().__init__(
-            message="Invalid RVC model file",
-            details=reason
-        )
-        self.file_path = file_path
-        self.reason = reason
-
-
-class ModelCorruptedException(ModelException):
-    """Model file is corrupted."""
-    
-    def __init__(self, file_path: str, reason: str):
-        super().__init__(
-            message="Model file is corrupted",
-            details=reason
-        )
-        self.file_path = file_path
-        self.reason = reason
-
-
-class ModelArchitectureMismatchException(ModelException):
-    """Model architecture doesn't match expected structure."""
-    
-    def __init__(self, expected: str, actual: str):
-        super().__init__(
-            message="Model architecture mismatch",
-            details=f"Expected {expected}, got {actual}"
-        )
-        self.expected = expected
-        self.actual = actual
-
-
-class InvalidIndexFileException(ModelException):
-    """Index file is invalid or corrupted."""
-    
-    def __init__(self, file_path: str, reason: str):
-        super().__init__(
-            message="Invalid index file",
-            details=reason
-        )
-        self.file_path = file_path
-        self.reason = reason
-
-
-class ModelLoadException(ModelException):
-    """Failed to load model into memory."""
-    
-    def __init__(self, file_path: str, reason: str):
-        super().__init__(
-            message="Failed to load model",
-            details=reason
-        )
-        self.file_path = file_path
-        self.reason = reason
-
-
-# =============================================================================
-# Inference Exceptions
-# =============================================================================
-
-class InferenceException(RVCWorkerException):
-    """Base class for inference errors."""
-    error_stage = "inference"
-    recoverable = False  # Usually need worker restart
-    http_status = 500
-
-
-class CUDAOutOfMemoryException(InferenceException):
-    """GPU ran out of memory."""
-    recoverable = False
-    
-    def __init__(self, required_mb: Optional[float] = None, available_mb: Optional[float] = None):
-        details = "GPU memory exhausted"
-        if required_mb and available_mb:
-            details = f"Requires ~{required_mb:.0f}MB, only {available_mb:.0f}MB available"
-        super().__init__(
-            message="CUDA out of memory",
-            details=details
-        )
-        self.required_mb = required_mb
-        self.available_mb = available_mb
-
-
-class PitchExtractionException(InferenceException):
-    """Pitch extraction (F0) failed."""
-    recoverable = True
-    
-    def __init__(self, method: str, reason: str):
-        super().__init__(
-            message=f"Pitch extraction failed ({method})",
-            details=reason
-        )
-        self.method = method
-        self.reason = reason
-
-
-class FeatureExtractionException(InferenceException):
-    """Feature extraction (HuBERT) failed."""
-    recoverable = True
-    
     def __init__(self, reason: str):
+        super().__init__("Invalid or unreadable audio file", reason)
+
+
+class AudioTooShortError(AudioError):
+    code = "AUDIO_TOO_SHORT"
+
+    def __init__(self, duration: float, minimum: float):
         super().__init__(
-            message="Feature extraction failed",
-            details=reason
+            "Audio is too short for processing",
+            f"Duration {duration:.2f}s < minimum {minimum}s",
         )
-        self.reason = reason
-
-
-class VoiceConversionException(InferenceException):
-    """Voice conversion inference failed."""
-    recoverable = True
-    
-    def __init__(self, reason: str):
-        super().__init__(
-            message="Voice conversion failed",
-            details=reason
-        )
-        self.reason = reason
-
-
-class InferenceTensorException(InferenceException):
-    """Tensor operation failed during inference."""
-    recoverable = False
-    
-    def __init__(self, operation: str, reason: str):
-        super().__init__(
-            message=f"Tensor operation failed: {operation}",
-            details=reason
-        )
-        self.operation = operation
-        self.reason = reason
+        self.duration = duration
 
 
 # =============================================================================
-# Encoding Exceptions
+# Model
 # =============================================================================
 
-class EncodingException(RVCWorkerException):
-    """Base class for audio encoding errors."""
-    error_stage = "encoding"
-    recoverable = True
+class ModelLoadError(RVCError):
+    code = "MODEL_LOAD_FAILED"
     http_status = 500
-
-
-class FFmpegNotAvailableException(EncodingException):
-    """FFmpeg is not installed or not accessible."""
     recoverable = False
-    
+
+    def __init__(self, reason: str):
+        super().__init__("Failed to load RVC model", reason)
+
+
+# =============================================================================
+# Inference
+# =============================================================================
+
+class InferenceError(RVCError):
+    code = "INFERENCE_FAILED"
+    http_status = 500
+    recoverable = True
+
+    def __init__(self, reason: str):
+        super().__init__("Voice conversion inference failed", reason)
+
+
+class CUDAOutOfMemoryError(RVCError):
+    code = "CUDA_OOM"
+    http_status = 500
+    recoverable = False
+
     def __init__(self):
         super().__init__(
-            message="FFmpeg not available",
-            details="FFmpeg is required for audio encoding but was not found"
+            "CUDA out of memory",
+            "GPU memory exhausted during inference",
         )
 
 
-class FFmpegEncodingException(EncodingException):
-    """FFmpeg encoding failed."""
-    
+# =============================================================================
+# Encoding
+# =============================================================================
+
+class EncodingError(RVCError):
+    code = "ENCODING_FAILED"
+    http_status = 500
+
     def __init__(self, reason: str, stderr: Optional[str] = None):
-        super().__init__(
-            message="Audio encoding failed",
-            details=reason
-        )
-        self.reason = reason
+        details = reason
+        if stderr:
+            details += f" | stderr={stderr[:300]}"
+        super().__init__("Audio encoding failed", details)
         self.stderr = stderr
 
 
-class OutputWriteException(EncodingException):
-    """Failed to write output file."""
-    
-    def __init__(self, file_path: str, reason: str):
+class FFmpegNotAvailableError(RVCError):
+    code = "FFMPEG_NOT_AVAILABLE"
+    http_status = 500
+    recoverable = False
+
+    def __init__(self):
         super().__init__(
-            message="Failed to write output file",
-            details=reason
+            "FFmpeg not available",
+            "FFmpeg is required but was not found on the system",
         )
-        self.file_path = file_path
-        self.reason = reason
 
 
 # =============================================================================
-# Upload Exceptions
+# Upload / S3
 # =============================================================================
 
-class UploadException(RVCWorkerException):
-    """Base class for upload errors."""
-    error_stage = "upload"
-    recoverable = True
+class S3NotConfiguredError(RVCError):
+    code = "S3_NOT_CONFIGURED"
+    http_status = 500
+    recoverable = False
+
+    def __init__(self, missing_vars: List[str]):
+        super().__init__(
+            "S3 storage not configured",
+            f"Missing env vars: {', '.join(missing_vars)}",
+        )
+
+
+class S3UploadError(RVCError):
+    code = "S3_UPLOAD_FAILED"
     http_status = 502
 
-
-class S3NotConfiguredException(UploadException):
-    """S3 is required but not configured."""
-    
-    def __init__(self, missing_vars: list):
-        super().__init__(
-            message="S3 storage not configured",
-            details=f"Missing environment variables: {', '.join(missing_vars)}"
-        )
-        self.missing_vars = missing_vars
-
-
-class S3CredentialsException(UploadException):
-    """S3 credentials are invalid."""
-    http_status = 403
-    
-    def __init__(self, reason: str):
-        super().__init__(
-            message="S3 authentication failed",
-            details=reason
-        )
-        self.reason = reason
-
-
-class S3BucketException(UploadException):
-    """S3 bucket access error."""
-    
-    def __init__(self, bucket: str, reason: str):
-        super().__init__(
-            message=f"S3 bucket error: {bucket}",
-            details=reason
-        )
-        self.bucket = bucket
-        self.reason = reason
-
-
-class S3UploadException(UploadException):
-    """S3 upload failed."""
-    
     def __init__(self, key: str, reason: str):
         super().__init__(
-            message="S3 upload failed",
-            details=f"Failed to upload {key}: {reason}"
+            "S3 upload failed",
+            f"key={key} | {reason}",
         )
         self.key = key
-        self.reason = reason
 
 
-class UploadTimeoutException(UploadException):
-    """Upload timed out."""
-    http_status = 504
-    
-    def __init__(self, timeout_seconds: float):
+# =============================================================================
+# Aggregate
+# =============================================================================
+
+class AllInputsFailedError(RVCError):
+    code = "ALL_INPUTS_FAILED"
+    http_status = 422
+    recoverable = True
+
+    def __init__(self, total: int, errors: List[str]):
         super().__init__(
-            message="Upload timeout",
-            details=f"Upload exceeded {timeout_seconds}s timeout"
+            f"All {total} input(s) failed to process",
+            "; ".join(errors[:5]),
         )
-        self.timeout_seconds = timeout_seconds
-
-
-# =============================================================================
-# Exception Mapping Helper
-# =============================================================================
-
-def classify_exception(exc: Exception) -> RVCWorkerException:
-    """
-    Convert a standard exception to an RVCWorkerException.
-    Useful for wrapping unexpected exceptions.
-    """
-    error_message = str(exc)
-    error_type = type(exc).__name__
-    
-    # CUDA OOM
-    if "CUDA out of memory" in error_message or "OutOfMemoryError" in error_type:
-        return CUDAOutOfMemoryException()
-    
-    # Network errors
-    if "URLError" in error_type or "ConnectionError" in error_type:
-        return URLNotReachableException("unknown", error_message)
-    
-    if "TimeoutError" in error_type or "timeout" in error_message.lower():
-        return DownloadTimeoutException("unknown", 30.0)
-    
-    # File errors
-    if "FileNotFoundError" in error_type:
-        return DownloadedFileCorruptException("unknown", "file", "File not found")
-    
-    # Audio errors
-    if "soundfile" in error_message.lower() or "LibsndfileError" in error_type:
-        return AudioCorruptedException("unknown", error_message)
-    
-    # Model errors
-    if "RuntimeError" in error_type and "size mismatch" in error_message.lower():
-        return ModelArchitectureMismatchException("expected", "actual")
-    
-    # Default: wrap as generic inference exception
-    return VoiceConversionException(f"{error_type}: {error_message}")
+        self.errors = errors
